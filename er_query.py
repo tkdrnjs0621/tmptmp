@@ -12,7 +12,8 @@ from tqdm import tqdm
 import os
 from torch.utils.data import DataLoader
 import json
-
+import accelerate
+from accelerate import Accelerator
 
 query_prompt_one_shot_input = """Please extract all named entities that are important for solving the questions below.
 Place the named entities in json format.
@@ -28,7 +29,6 @@ query_prompt_template = """
 Question: {}
 
 """
-
 
 messages_ner =  [{"role":"system","content":"You're a very effective entity extraction system."},
                          {"role":"user","content":query_prompt_one_shot_input},
@@ -66,24 +66,12 @@ Jacques Thieffry (Person)"""},
 composer (noun)"""}, 
 ]
 
-def generate(model, tokenizer, dataloader, **kwargs):
-    output_ids = []
-    for i, inputs in tqdm(enumerate(dataloader, start=1),total=len(dataloader)):
-        inputs = inputs.to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(**inputs, pad_token_id=tokenizer.eos_token_id, **kwargs)
-        output_ids.extend(outputs[:, inputs["input_ids"].size(1) :].tolist())
-    return output_ids
 
 def build_prompt(example, tokenizer):
     prompt = tokenizer.apply_chat_template(example["messages"], tokenize=False, add_generation_prompt=True)
     prompt_tokens = len(tokenizer(prompt, add_special_tokens=False).input_ids)
     return {"prompt": prompt, "prompt_tokens": prompt_tokens}
 
-def collate_fn(batch, tokenizer):
-    prompt = [example["prompt"] for example in batch]
-    inputs = tokenizer(prompt, add_special_tokens=False, padding=True, return_tensors="pt")
-    return inputs
 
 def decode(example, tokenizer, feature):
     text = tokenizer.decode(example[feature + "_ids"], skip_special_tokens=True)
@@ -132,48 +120,88 @@ def map_json_dict(row):
     row['entities']= extracted["named_entities"] if extracted!='' and 'named_entities' in extracted else ['']
     return row
 
+def generate(model, tokenizer, dataloader, accelerator, **kwargs):
+    output_ids = []
+    for i, inputs in tqdm(enumerate(dataloader, start=1), total=len(dataloader)):
+        inputs = accelerator.prepare(inputs)  # Ensure inputs are moved to the correct device
+        with torch.no_grad():
+            outputs =accelerator.unwrap_model(model).generate(
+                **inputs, pad_token_id=tokenizer.eos_token_id, **kwargs
+            )
+        output_ids.extend(outputs[:, inputs["input_ids"].size(1):].tolist())
+    return output_ids
 
-if __name__=="__main__":
+def collate_fn(batch, tokenizer):
+    prompts = [example["prompt"] for example in batch]
+    inputs = tokenizer(prompts, add_special_tokens=False, padding=True, return_tensors="pt")
+    return inputs
+
+# Updated main script
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Full Run")
     parser.add_argument('--dataset_path', type=str, default='BeIR/msmarco')
     parser.add_argument('--model_path', type=str, default='meta-llama/Llama-3.1-8B-Instruct', help='Specific model name')
-    parser.add_argument("--save_path", type=str, default="data/msmarco_er.jsonl", help="path to inference data to evaluate (e.g. inference/baseline/zero_v1/Llama-3.1-8B-Instruct)")
-    parser.add_argument("--ner_opt", choices=['entityrag','hipporag_original'], default='entityrag', help="path to inference data to evaluate (e.g. inference/baseline/zero_v1/Llama-3.1-8B-Instruct)")
-  
-    parser.add_argument("--batch_size", type=int, default=8, help="batch size for inference")
-    parser.add_argument("--")
-    parser.add_argument("--num_proc", type=int, default=16, help="number of processors for processing datasets")
-    parser.add_argument("--max_tokens", type=int, default=300, help="generation config; max new tokens")
-    parser.add_argument("--do_sample", type=bool, default=False, help="generation config; whether to do sampling, greedy if not set")
-    parser.add_argument("--temperature", type=float, default=0.0, help="generation config; temperature")
-    parser.add_argument("--top_k", type=int, default=50, help="generation config; top k")
-    parser.add_argument("--top_p", type=float, default=0.1, help="generation config; top p, nucleus sampling")
-    
+    parser.add_argument("--save_path", type=str, default="data/msmarco_er.jsonl", help="Path to save inference results")
+    parser.add_argument("--ner_opt", choices=['entityrag', 'hipporag_original'], default='entityrag')
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
+    parser.add_argument("--num_proc", type=int, default=16, help="Number of processors for processing datasets")
+    parser.add_argument("--max_tokens", type=int, default=300, help="Generation config; max new tokens")
+    parser.add_argument("--do_sample", type=bool, default=False, help="Generation config; sampling flag")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Generation config; temperature")
+    parser.add_argument("--top_k", type=int, default=50, help="Generation config; top k")
+    parser.add_argument("--top_p", type=float, default=0.1, help="Generation config; top p, nucleus sampling")
     args = parser.parse_args()
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.bfloat16, device_map="auto", attn_implementation="flash_attention_2")
+    # Initialize the accelerator
+    accelerator = Accelerator()
+
+    # Load model and tokenizer
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2"
+    )
     tokenizer = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
+
     model.eval()
 
-    dataset = load_dataset(args.dataset_path, 'queries')['queries'].rename_column('text','question')
+    # Load dataset
+    dataset = load_dataset(args.dataset_path, 'queries')['queries'].rename_column('text', 'question')
 
-    if(args.ner_opt=='hipporag_original'):
+    # Prepare dataset for NER options
+    if args.ner_opt == 'hipporag_original':
         dataset = dataset.map(map_messages_hipporag)
     else:
         dataset = dataset.map(map_messages_entityrag)
-    dataset = dataset.map(partial(build_prompt, tokenizer=tokenizer),num_proc=args.num_proc)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_proc, collate_fn=partial(collate_fn, tokenizer=tokenizer), pin_memory=True) 
+    dataset = dataset.map(partial(build_prompt, tokenizer=tokenizer), num_proc=args.num_proc)
 
-    output_ids = generate(model, tokenizer, dataloader, max_new_tokens=args.max_tokens, do_sample=args.do_sample, temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)
-    dataset = dataset.add_column("output_ids", output_ids)  # type: ignore
+    # Prepare dataloader
+    dataloader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_proc,
+        collate_fn=partial(collate_fn, tokenizer=tokenizer), pin_memory=True
+    )
+
+    # Prepare model and dataloader with Accelerator
+    model, dataloader = accelerator.prepare(model, dataloader)
+
+    # Generate outputs
+    output_ids = generate(
+        model, tokenizer, dataloader, accelerator,
+        max_new_tokens=args.max_tokens, do_sample=args.do_sample,
+        temperature=args.temperature, top_k=args.top_k, top_p=args.top_p
+    )
+
+    # Add and decode outputs
+    dataset = dataset.add_column("output_ids", output_ids)
     dataset = dataset.map(partial(decode, tokenizer=tokenizer, feature="output"), num_proc=args.num_proc)
 
-    if(args.ner_opt=='hipporag_original'):
+    # Post-process results
+    if args.ner_opt == 'hipporag_original':
         dataset = dataset.map(map_json_dict, num_proc=args.num_proc)
     else:
         dataset = dataset.map(map_entity, num_proc=args.num_proc)
 
-    dataset = dataset.select_columns(["_id",'title',"question","entities"])
-
+    # Select relevant columns and save results
+    dataset = dataset.select_columns(["_id", "title", "question", "entities"])
     dataset.to_json(args.save_path, orient="records", lines=True)
