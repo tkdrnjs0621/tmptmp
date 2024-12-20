@@ -15,6 +15,8 @@ import json
 import accelerate
 from accelerate import Accelerator
 
+from accelerate import PartialState
+from accelerate.utils import gather_object
 query_prompt_one_shot_input = """Please extract all named entities that are important for solving the questions below.
 Place the named entities in json format.
 
@@ -120,17 +122,20 @@ def map_json_dict(row):
     row['entities']= extracted["named_entities"] if extracted!='' and 'named_entities' in extracted else ['']
     return row
 
-def generate(model, tokenizer, dataloader, accelerator, **kwargs):
+def generate(model, tokenizer, dataloader,  **kwargs):
     output_ids = []
-    for i, inputs in tqdm(enumerate(dataloader, start=1), total=len(dataloader)):
-        inputs = accelerator.prepare(inputs)  # Ensure inputs are moved to the correct device
-        with torch.no_grad():
-            outputs =accelerator.unwrap_model(model).generate(
-                **inputs, pad_token_id=tokenizer.eos_token_id, **kwargs
-            )
-        output_ids.extend(outputs[:, inputs["input_ids"].size(1):].tolist())
-    return output_ids
-
+    cpp=[]
+    with distributed_state.split_between_processes(dataloader) as mdataloader:
+        for i, inputs in tqdm(enumerate(mdataloader, start=1), total=len(mdataloader)):
+            inputs = inputs.to(distributed_state.device)
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs, pad_token_id=tokenizer.eos_token_id, **kwargs
+                )
+            cpp.extend(outputs[:, inputs["input_ids"].size(1):].tolist())
+    # output_ids = gather_object(cpp)
+    # return output_ids
+    return cpp
 def collate_fn(batch, tokenizer):
     prompts = [example["prompt"] for example in batch]
     inputs = tokenizer(prompts, add_special_tokens=False, padding=True, return_tensors="pt")
@@ -143,7 +148,7 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, default='meta-llama/Llama-3.1-8B-Instruct', help='Specific model name')
     parser.add_argument("--save_path", type=str, default="data/msmarco_er.jsonl", help="Path to save inference results")
     parser.add_argument("--ner_opt", choices=['entityrag', 'hipporag_original'], default='entityrag')
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for inference")
     parser.add_argument("--num_proc", type=int, default=16, help="Number of processors for processing datasets")
     parser.add_argument("--max_tokens", type=int, default=300, help="Generation config; max new tokens")
     parser.add_argument("--do_sample", type=bool, default=False, help="Generation config; sampling flag")
@@ -153,11 +158,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Initialize the accelerator
-    accelerator = Accelerator()
-
+    
+    distributed_state = PartialState()
     # Load model and tokenizer
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
+        device_map=distributed_state.device,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2"
     )
@@ -167,7 +173,7 @@ if __name__ == "__main__":
     model.eval()
 
     # Load dataset
-    dataset = load_dataset(args.dataset_path, 'queries')['queries'].rename_column('text', 'question')
+    dataset = load_dataset(args.dataset_path, 'queries')['queries'].rename_column('text', 'question').select(range(1200))
 
     # Prepare dataset for NER options
     if args.ner_opt == 'hipporag_original':
@@ -182,12 +188,10 @@ if __name__ == "__main__":
         collate_fn=partial(collate_fn, tokenizer=tokenizer), pin_memory=True
     )
 
-    # Prepare model and dataloader with Accelerator
-    model, dataloader = accelerator.prepare(model, dataloader)
 
     # Generate outputs
     output_ids = generate(
-        model, tokenizer, dataloader, accelerator,
+        model, tokenizer, dataloader,
         max_new_tokens=args.max_tokens, do_sample=args.do_sample,
         temperature=args.temperature, top_k=args.top_k, top_p=args.top_p
     )
