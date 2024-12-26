@@ -5,7 +5,6 @@ import os
 import re
 from functools import partial
 
-import accelerate
 import torch
 from accelerate import Accelerator
 from datasets import load_dataset
@@ -158,12 +157,32 @@ def collate_fn(batch, tokenizer):
     return inputs
 
 
-# Updated main script
+def save_outputs(outputs, output_dir, process_index):
+    output_file = os.path.join(output_dir, f"output_{process_index}.jsonl")
+    with open(output_file, "w") as f:
+        for line in outputs:
+            f.write(json.dumps(line) + "\n")
+
+
+def load_outputs(output_dir):
+    outputs = []
+    for file_name in os.listdir(output_dir):
+        if file_name.startswith("output_") and file_name.endswith(".jsonl"):
+            file_path = os.path.join(output_dir, file_name)
+            with open(file_path, "r") as f:
+                for line in f:
+                    outputs.append(json.loads(line.strip()))
+            # os.remove(file_path)  # Delete the file after reading
+    return outputs
+
+
 if __name__ == "__main__":
+    # Argument parsing for runtime configurations
     parser = argparse.ArgumentParser(description="Full Run")
     parser.add_argument("--dataset_path", type=str, default="BeIR/msmarco")
     parser.add_argument("--model_path", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="Specific model name")
     parser.add_argument("--save_path", type=str, default="data/msmarco_er.jsonl", help="Path to save inference results")
+    parser.add_argument("--output_dir", type=str, default="output", help="Directory to save intermediate outputs")
     parser.add_argument("--ner_opt", choices=["entityrag", "hipporag_original"], default="entityrag")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
     parser.add_argument("--num_proc", type=int, default=16, help="Number of processors for processing datasets")
@@ -174,6 +193,10 @@ if __name__ == "__main__":
     parser.add_argument("--top_p", type=float, default=1.0, help="Generation config; top p, nucleus sampling")
     args = parser.parse_args()
 
+    # Create the output directory if it doesn't already exist
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Set the precision for floating-point matrix multiplications
     torch.set_float32_matmul_precision("high")
 
     # Initialize the accelerator
@@ -185,34 +208,59 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Load dataset
+    # Load model and tokenizer
+    # Use flash attention for efficient inference
     dataset = load_dataset(args.dataset_path, "queries")["queries"].rename_column("text", "question")
 
-    # Prepare dataset for NER options
+    # Apply the appropriate NER option to map messages
     dataset = dataset.map(map_messages_hipporag) if args.ner_opt == "hipporag_original" else dataset.map(map_messages_entityrag)
     dataset = dataset.map(partial(build_prompt, tokenizer=tokenizer), num_proc=args.num_proc)
 
-    # Prepare dataloader
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_proc, collate_fn=partial(collate_fn, tokenizer=tokenizer), pin_memory=True)
+    # Prepare a DataLoader for efficient data batching
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_proc,
+        collate_fn=partial(collate_fn, tokenizer=tokenizer),
+        pin_memory=True,
+    )
 
-    # Prepare model and dataloader with Accelerator
+    # Prepare the model and dataloader with the Accelerator
     model, dataloader = accelerator.prepare(model, dataloader)
 
-    # Generate outputs
-    generation_config = {"max_new_tokens": args.max_tokens, "do_sample": args.do_sample, "temperature": args.temperature, "top_k": args.top_k, "top_p": args.top_p}
+    # Define the configuration for text generation
+    generation_config = {
+        "max_new_tokens": args.max_tokens,
+        "do_sample": args.do_sample,
+        "temperature": args.temperature,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+    }
+
+    # Generate text outputs using the model
     output_ids = generate(model, tokenizer, dataloader, accelerator, generation_config)
-    output_ids = accelerate.utils.gather_object(output_ids)
+
+    # Save the generated outputs to a file specific to the process
+    save_outputs(output_ids, args.output_dir, accelerator.process_index)
+
+    # Ensure all processes have completed saving their outputs
+    accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
-        # Add and decode outputs
+        # Main process aggregates all outputs from the individual files
+        output_ids = load_outputs(args.output_dir)
+
+        # Add the outputs to the dataset and decode them
         dataset = dataset.add_column("output_ids", output_ids)
         dataset = dataset.map(partial(decode, tokenizer=tokenizer, feature="output"), num_proc=args.num_proc)
 
-        # Post-process results
+        # Apply post-processing to the results
         dataset = dataset.map(map_json_dict, num_proc=args.num_proc) if args.ner_opt == "hipporag_original" else dataset.map(map_entity, num_proc=args.num_proc)
 
-        # Select relevant columns and save results
+        # Select only the relevant columns and save the final results
         dataset = dataset.select_columns(["_id", "title", "question", "entities"])
         dataset.to_json(args.save_path, orient="records", lines=True)
 
+    # End the training or inference session
     accelerator.end_training()
